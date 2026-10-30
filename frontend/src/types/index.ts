@@ -1,0 +1,127 @@
+// 类型统一从 Wails 生成的绑定里再导出：前端类型与 Go 结构体只有一个来源，
+// 不再手写一份可能与后端漂移的镜像定义。
+export type {
+  Account,
+  AgentApplyResult,
+  AgentBackup,
+  AgentTarget,
+  AuditLog,
+  AutoStartStatus,
+  ChatMessage,
+  ClientSession,
+  Config,
+  CreditLog,
+  Dashboard,
+  HourStat,
+  InjectConfig,
+  InstalledSkill,
+  KeyStat,
+  ModelInfo,
+  ModelPrice,
+  ModelStat,
+  ModelsConfig,
+  NextRun,
+  Overview,
+  PoolConfig,
+  PluginApplyResult,
+  PluginBackup,
+  PluginSettings,
+  PluginSlashCommand,
+  PluginStatus,
+  PluginTargetStatus,
+  PromptConfig,
+  RedisConfig,
+  RequestLog,
+  RequestLogCost,
+  ScheduleConfig,
+  SchedulerStatus,
+  SecurityConfig,
+  SessionConfig,
+  SessionDrilldown,
+  SessionStat,
+  SkillHubBrowseResult,
+  SkillHubCLIStatus,
+  SkillHubSkill,
+  SkillInstallResult,
+  SkillHubConfig,
+  SkillTargetInfo,
+  SkillUpdateItem,
+  SkillUpdateResult,
+  SkillUpdatesResult,
+  TaskLog,
+  TaskRun,
+  TaskRunDetail,
+  TaskStat,
+  TrendPoint,
+  ClientSwitchPrecheck,
+  ClientTokenSource,
+  ClientTokenStats,
+  ClientUsageDay,
+  ClientUsageModel,
+  ClientUsageProject,
+  ClientUsageSession,
+  ClientUsageSummary,
+  DataMigrationDiag,
+  DataMigrationResult,
+  OfficialUsageAccount,
+  OfficialUsageDay,
+  OfficialUsageModel,
+  OfficialUsageReport,
+} from "../../bindings/workbuddy-desktop/internal/core/models";
+
+export type {
+  AccountListResult,
+  AccountQuery,
+  ApplyParams,
+  AuditLogPage,
+  AwakeStatus,
+  BackupItem,
+  BrowseParams,
+  ChatParams,
+  ChatResult,
+  ConfigMeta,
+  ConfigExportResult,
+  CreateKeyParams,
+  CreateKeyResult,
+  CredentialExportResult,
+  CreditDetail,
+  CreditDetailDay,
+  CreditDetailTask,
+  CreditLogPage,
+  GatewayConfig,
+  GatewayStatus,
+  ImportResult,
+  KeyUsage,
+  KeyView,
+  LogExportResult,
+  LogQuery,
+  ModelUsage,
+  OAuthHint,
+  OAuthPollResult,
+  RequestLogPage,
+  SkillInstallParams,
+  SystemInfo,
+  TaskLogPage,
+  UpdateInfo,
+} from "../../bindings/workbuddy-desktop/internal/api/models";
+
+/** 注入模块运行态与账号备份（internal/inject） */
+export type { AccountBackup } from "../../bindings/workbuddy-desktop/internal/inject/models";
+export type { Status as InjectStatus } from "../../bindings/workbuddy-desktop/internal/inject/models";
+
+/** 免费额度摆渡（internal/ferry）：Status 与 DOM 的 Status 同名，统一加 Ferry 前缀 */
+export type {
+  ModelView as FerryModelView,
+  Status as FerryStatus,
+  VariantOption as FerryVariantOption,
+  Verdict as FerryVerdict,
+} from "../../bindings/workbuddy-desktop/internal/ferry/models";
+
+/** 账号状态（与后端 deriveStatus 的取值一致） */
+export type AccountStatus = "online" | "cooldown" | "expired" | "disabled" | "unknown" | "invalid" | "relogin";
+
+/** 任务类型（activity/school/cat/growth 为扩展任务） */
+export type TaskType = "checkin" | "travel" | "keepalive" | "activity" | "school" | "cat" | "growth";
+
+/** 任务状态 */
+export type TaskStatus = "success" | "failed" | "skipped";

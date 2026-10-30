@@ -1,0 +1,693 @@
+package core
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ============================================================
+// 客户端账号切换（写入官方登录文件 + 重启客户端）
+//
+// 思路对齐 workbuddy-switch / WorkDaddy（思路复刻、实现自写）：
+//   1. 备份官方当前登录文件（可随时手工还原）
+//   2. 退出官方客户端
+//   3. 把账号池中目标账号的凭证写入官方固定登录位（原子写，0600）
+//   4. 重新启动客户端，写入的账号即当前登录
+//
+// 两个必做补丁（否则写入等于没写 / 会话丢失）：
+//   - 清 `<登录位>.logged-out`：客户端登出时写的标记，启动恢复见它直接判未登录；
+//   - 克隆会话到目标账号（clientsession_clone.go）：客户端侧边栏按账号过滤，
+//     不克隆则新登录账号看不到当前账号的历史会话。
+//
+// 防御逻辑（对齐 WorkDaddy resolveAuthTarget 的校验思路）：
+//   - 跨通道拒绝：官方当前登录与目标账号 realm 不同（国内/国际）时拒绝切换；
+//   - 坏数据拒绝：官方登录文件存在但解析失败时不覆盖（防止毁掉现有登录）。
+// ============================================================
+
+// EventClientSwitch 客户端切换进度事件（step: backup/stop/write/start/done/error）
+const EventClientSwitch = "clientswitch:progress"
+
+// OfficialClientAuthFile 官方客户端固定登录位路径（官方唯一实际读取的文件）。
+func OfficialClientAuthFile() (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, "Library", "Application Support",
+			"CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"), nil
+	case "windows":
+		local, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		// Windows 官方客户端登录位（社区工具实测路径；未经真机验证，如不一致请反馈）
+		return filepath.Join(local, "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"), nil
+	default:
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, ".config", "CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info"), nil
+	}
+}
+
+// findOfficialClient 探测官方客户端（显式路径优先；macOS 扫描 /Applications）。
+func findOfficialClient(explicit string) (bin string, appDir string, err error) {
+	if p := strings.TrimSpace(explicit); p != "" {
+		if st, serr := os.Stat(p); serr == nil && !st.IsDir() {
+			return p, filepath.Dir(filepath.Dir(p)), nil
+		}
+		return "", "", fmt.Errorf("指定的客户端路径不存在: %s", p)
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		matches, _ := filepath.Glob("/Applications/WorkBuddy*.app/Contents/MacOS/Electron")
+		if len(matches) == 0 {
+			return "", "", fmt.Errorf("未在 /Applications 下找到 WorkBuddy 客户端，可在设置中指定路径")
+		}
+		return matches[0], filepath.Dir(filepath.Dir(matches[0])), nil
+	case "windows":
+		// 多路径探测：按常见安装位置顺序搜索
+		candidates := []string{}
+		// 1. %LOCALAPPDATA%\Programs\WorkBuddy*
+		if local, e := os.UserCacheDir(); e == nil {
+			if m, _ := filepath.Glob(filepath.Join(local, "Programs", "WorkBuddy*", "WorkBuddy.exe")); len(m) > 0 {
+				candidates = append(candidates, m...)
+			}
+		}
+		// 2. %LOCALAPPDATA%\WorkBuddy\WorkBuddy.exe
+		if local, e := os.UserCacheDir(); e == nil {
+			p := filepath.Join(local, "WorkBuddy", "WorkBuddy.exe")
+			if _, e := os.Stat(p); e == nil {
+				candidates = append(candidates, p)
+			}
+		}
+		// 3. %PROGRAMFILES%\WorkBuddy\WorkBuddy.exe
+		if pf := os.Getenv("PROGRAMFILES"); pf != "" {
+			p := filepath.Join(pf, "WorkBuddy", "WorkBuddy.exe")
+			if _, e := os.Stat(p); e == nil {
+				candidates = append(candidates, p)
+			}
+		}
+		// 4. %PROGRAMFILES(X86)%\WorkBuddy\WorkBuddy.exe
+		if pf := os.Getenv("PROGRAMFILES(X86)"); pf != "" {
+			p := filepath.Join(pf, "WorkBuddy", "WorkBuddy.exe")
+			if _, e := os.Stat(p); e == nil {
+				candidates = append(candidates, p)
+			}
+		}
+		if len(candidates) == 0 {
+			return "", "", fmt.Errorf("未找到 WorkBuddy 客户端（已搜索 Programs、Local、Program Files 等目录），可在设置中指定路径")
+		}
+		return candidates[0], filepath.Dir(candidates[0]), nil
+	default:
+		return "", "", fmt.Errorf("当前平台（%s）暂不支持自动探测客户端，请手动指定", runtime.GOOS)
+	}
+}
+
+// ClientSwitchPrecheck 切换前检查结果（前端据此渲染确认信息）
+type ClientSwitchPrecheck struct {
+	UID              string `json:"uid"`
+	Nickname         string `json:"nickname"`
+	TargetRealm      string `json:"targetRealm"`
+	OfficialAuthFile string `json:"officialAuthFile"`
+	OfficialExists   bool   `json:"officialExists"`
+	OfficialRealm    string `json:"officialRealm"` // 当前官方登录区域（解析失败为空）
+	ClientFound      bool   `json:"clientFound"`
+	ClientPath       string `json:"clientPath"`
+	ClientRunning    bool   `json:"clientRunning"`
+	BackupDir        string `json:"backupDir"`
+	CurrentUID       string `json:"currentUid,omitempty"`    // 官方当前登录 uid（明文，取不到为空）
+	LogoutMarker     bool   `json:"logoutMarker"`            // 存在客户端登出标记（启动时会忽略登录文件）
+	LocalSessions    int    `json:"localSessions,omitempty"` // 当前账号可迁移的本地会话数
+	Warnings         string `json:"warnings,omitempty"`
+}
+
+// parseOfficialAuthForSwitch 专为客户端切换场景解析官方登录文件：
+// 只要能读出 uid 和 realm 即可，不校验 token 是否明文（官方 v5.6+ 的 token 恒为加密信封）。
+func parseOfficialAuthForSwitch(raw []byte) (uid, realm string) {
+	var doc map[string]any
+	if json.Unmarshal(raw, &doc) != nil {
+		return "", ""
+	}
+	// 嵌套形态 {"auth":{...},"account":{...}}
+	if acct, ok := doc["account"].(map[string]any); ok {
+		uid, _ = acct["uid"].(string)
+	}
+	if uid == "" {
+		// 扁平形态兜底
+		uid, _ = doc["uid"].(string)
+	}
+	// realm：显式字段优先，其次按 domain 推断
+	if auth, ok := doc["auth"].(map[string]any); ok {
+		if r, ok := auth["realm"].(string); ok && r != "" {
+			realm = r
+		} else if d, ok := auth["domain"].(string); ok && d != "" {
+			realm = resolveRealm("", d)
+		}
+	}
+	if realm == "" {
+		if r, ok := doc["realm"].(string); ok && r != "" {
+			realm = r
+		} else if d, ok := doc["domain"].(string); ok && d != "" {
+			realm = resolveRealm("", d)
+		}
+	}
+	return uid, realm
+}
+
+// ClientSwitchPrecheck 切换前检查：目标账号、官方登录位状态、客户端探测。
+func (s *Service) ClientSwitchPrecheck(uid string) (*ClientSwitchPrecheck, error) {
+	pre := &ClientSwitchPrecheck{}
+	acc, ok := s.FindAccount(uid)
+	if !ok {
+		return nil, fmt.Errorf("账号 %s 不存在", uid)
+	}
+	pre.UID, pre.Nickname, pre.TargetRealm = uid, acc.Nickname, acc.Realm
+
+	authFile, err := OfficialClientAuthFile()
+	if err != nil {
+		return nil, err
+	}
+	pre.OfficialAuthFile = authFile
+	if raw, err := os.ReadFile(authFile); err == nil {
+		pre.OfficialExists = true
+		pre.CurrentUID = clientSessionUID(raw)
+		// 先用 ParseCredential 完整解析（兼容扁平/嵌套，支持加密信封）
+		if c, perr := ParseCredential(authFile, raw); perr == nil && c != nil {
+			pre.OfficialRealm = c.Realm
+		} else {
+			// ParseCredential 因 token 加密而失败时，退化为轻量解析：只读 uid/realm
+			_, realm := parseOfficialAuthForSwitch(raw)
+			if realm != "" {
+				pre.OfficialRealm = realm
+			} else {
+				pre.Warnings = joinWarn(pre.Warnings, "官方登录文件存在但无法解析——为保护现有登录，本次切换将拒绝执行")
+			}
+		}
+	}
+	// 客户端登出时会留下 <登录位>.logged-out，启动恢复逻辑见到它就直接判未登录，
+	// 因此切换必须顺手清理，否则写入的凭证永远不生效。
+	pre.LogoutMarker = fileExists(officialAuthLogoutMarker(authFile))
+	if pre.LogoutMarker {
+		pre.Warnings = joinWarn(pre.Warnings, "官方客户端处于登出状态（存在登出标记），切换时会自动清理")
+	}
+	if pre.CurrentUID != "" && pre.CurrentUID != uid {
+		pre.LocalSessions = clientLocalSessionCount(pre.CurrentUID)
+		if pre.LocalSessions > 0 && !clientSessionCloneSupportedAt(workbuddyRoot()) {
+			pre.Warnings = joinWarn(pre.Warnings,
+				"客户端数据目录缺少 projects/ 或 sessions 表，本次切换不会克隆会话（目标账号看不到当前账号的历史会话）")
+		}
+	}
+	if pre.OfficialRealm != "" && pre.TargetRealm != "" && pre.OfficialRealm != pre.TargetRealm {
+		pre.Warnings = joinWarn(pre.Warnings, fmt.Sprintf(
+			"跨通道切换：官方当前为 %s 版，目标账号为 %s 版，已拒绝（请先在官方客户端登录同通道账号）",
+			pre.OfficialRealm, pre.TargetRealm))
+	}
+
+	bin, _, ferr := findOfficialClient(s.GetConfig().Inject.ClientPath)
+	if ferr == nil {
+		pre.ClientFound, pre.ClientPath = true, bin
+		pre.ClientRunning = clientProcessRunning(bin)
+	} else {
+		pre.Warnings = joinWarn(pre.Warnings, ferr.Error())
+	}
+	pre.BackupDir = s.clientSwitchBackupDir()
+	return pre, nil
+}
+
+func joinWarn(a, b string) string {
+	if a == "" {
+		return b
+	}
+	return a + "；" + b
+}
+
+func (s *Service) clientSwitchBackupDir() string {
+	return filepath.Join(filepath.Dir(s.ConfigPath()), "clientswitch")
+}
+
+// officialAuthLogoutMarker 客户端登出标记路径（官方 asar：getLogoutMarkerPath = `${authFile}.logged-out`）。
+// 客户端退出登录时写入，启动恢复时存在即忽略登录位文件。
+func officialAuthLogoutMarker(authFile string) string {
+	return authFile + ".logged-out"
+}
+
+// clearLogoutMarker 删除登出标记（及其 retire 残留），无标记时视为成功。
+func clearLogoutMarker(authFile string) error {
+	marker := officialAuthLogoutMarker(authFile)
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// retireLogoutMarker 会重命名为 <marker>.retired.<pid>.<uuid> 再删除，异常退出可能留残留
+	if matches, err := filepath.Glob(marker + ".retired.*"); err == nil {
+		for _, p := range matches {
+			_ = os.Remove(p)
+		}
+	}
+	return nil
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
+}
+
+// clientLocalSessionCount 统计某账号名下可迁移的本地会话数（云端会话归服务端，不迁移）。
+func clientLocalSessionCount(uid string) int {
+	return clientLocalSessionCountAt(workbuddyDBPath(), uid)
+}
+
+func clientLocalSessionCountAt(dbPath, uid string) int {
+	if uid == "" {
+		return 0
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return 0
+	}
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=busy_timeout(3000)")
+	if err != nil {
+		return 0
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sessions WHERE user_id = ? AND transport = 'local'`, uid).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// migrateClientSessions 旧实现（把 fromUID 名下的本地会话改归属到 toUID）已被
+// 会话克隆取代：改归属会把源账号会话整批搬走，切回来就没了。克隆实现见
+// clientsession_clone.go 的 cloneClientSessions —— 源账号原样保留，只给目标账号
+// 一份新 id 的副本（正文 jsonl + sessions 行 + edge-sync 云端映射）。
+
+// ClientSwitchAccount 执行切换四步流水线，每步发进度事件。同步执行（整体约 5-10 秒）。
+func (s *Service) ClientSwitchAccount(uid string) error {
+	acc, ok := s.FindAccount(uid)
+	if !ok {
+		return fmt.Errorf("账号 %s 不存在", uid)
+	}
+	pre, err := s.ClientSwitchPrecheck(uid)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(pre.Warnings, "拒绝") {
+		return fmt.Errorf("%s", pre.Warnings)
+	}
+	if !pre.ClientFound {
+		return fmt.Errorf("未找到官方客户端，无法切换")
+	}
+
+	switchStep := func(step, message string) {
+		EmitEvent(EventClientSwitch, map[string]any{"step": step, "uid": uid, "message": message})
+	}
+
+	// 1. 备份官方当前登录文件
+	switchStep("backup", "备份官方当前登录文件")
+	backup := ""
+	if pre.OfficialExists {
+		dir := s.clientSwitchBackupDir()
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("创建备份目录失败: %w", err)
+		}
+		backup = filepath.Join(dir, fmt.Sprintf("backup-%s.info", time.Now().Format("20060102-150405")))
+		raw, err := os.ReadFile(pre.OfficialAuthFile)
+		if err != nil {
+			return fmt.Errorf("读取官方登录文件失败: %w", err)
+		}
+		if err := os.WriteFile(backup, raw, 0o600); err != nil {
+			return fmt.Errorf("写入备份失败: %w", err)
+		}
+	}
+
+	// 2. 退出官方客户端
+	if pre.ClientRunning {
+		switchStep("stop", "退出官方客户端（请先确认已保存工作内容）")
+		if err := stopOfficialClient(pre.ClientPath, pre.ClientPath); err != nil {
+			return fmt.Errorf("退出客户端失败: %w", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// 3. 写入目标账号凭证到官方登录位（原子写）
+	// v5.6+ 走嵌套 session（auth/account），凭证保护 off 时 codec 按字符串透传。
+	// 不能直接把池扁平文件塞过去，否则 session.auth?.accessToken 为空、被判定为未登录。
+	switchStep("write", fmt.Sprintf("写入账号 %s 的登录凭证（嵌套 session）", acc.Nickname))
+	cred, err := LoadUpstreamCred(s.AuthDir(), acc.Credential)
+	if err != nil {
+		return fmt.Errorf("读取账号凭证失败: %w", err)
+	}
+	payload, err := buildOfficialAuthFile(cred, acc.Nickname)
+	if err != nil {
+		return fmt.Errorf("构造官方登录文件失败: %w", err)
+	}
+	tmp := pre.OfficialAuthFile + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(pre.OfficialAuthFile), 0o700); err != nil {
+		return fmt.Errorf("创建登录目录失败: %w", err)
+	}
+	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
+		return fmt.Errorf("写入登录文件失败: %w", err)
+	}
+	if err := os.Rename(tmp, pre.OfficialAuthFile); err != nil {
+		return fmt.Errorf("替换登录文件失败: %w", err)
+	}
+
+	// 3.1 保留会话：把当前账号名下的本地会话克隆一份给目标账号（新 id + 正文 +
+	// 云端映射），源账号会话原样保留——否则切换后侧边栏按 user_id 过滤，原账号的
+	// 历史会话全部不可见；而「改归属」式迁移会让源账号永久失去这些会话。
+	// 失败则回滚登录位（此时客户端已停止，回滚 = 恢复原文），避免「会话归 B、登录仍是 A」的错位。
+	if pre.CurrentUID != "" && pre.CurrentUID != uid && pre.LocalSessions > 0 {
+		switchStep("sessions", fmt.Sprintf("克隆当前账号的 %d 个会话到 %s（源账号会话保留）", pre.LocalSessions, acc.Nickname))
+		n, merr := s.cloneClientSessions(pre.CurrentUID, uid)
+		if merr != nil {
+			if backup != "" {
+				if raw, rerr := os.ReadFile(backup); rerr == nil {
+					_ = os.WriteFile(pre.OfficialAuthFile, raw, 0o600)
+				}
+			}
+			return fmt.Errorf("克隆会话失败（登录位已回滚）: %w", merr)
+		}
+		switchStep("sessions", fmt.Sprintf("已克隆 %d 个会话", n))
+	}
+
+	// 3.2 清理登出标记：客户端退出登录会写 <登录位>.logged-out，启动恢复时
+	// 只要它存在就直接判未登录（log: Auth logout marker found, ignoring stored session），
+	// 不清理的话本节写入的凭证永远不会生效。
+	if err := clearLogoutMarker(pre.OfficialAuthFile); err != nil {
+		return fmt.Errorf("清理登录登出标记失败: %w", err)
+	}
+
+	// 4. 重新启动客户端（带 CDP 端口，避免切换后再次注入时强杀）
+	switchStep("start", "重新启动官方客户端")
+	if err := startOfficialClient(pre.ClientPath, s.GetConfig().Inject.Port); err != nil {
+		return fmt.Errorf("启动客户端失败: %w（登录文件已写入，可手动打开客户端）", err)
+	}
+	// 5. 确认登录真的生效：客户端启动后会自己 store()/refresh()，
+	// 若凭证不被接受（刷新 401），它会立刻 clean() 并重新写登出标记——
+	// 只看「进程起来了」就报成功，正是「写了文件但界面仍未登录」的来源。
+	switchStep("verify", "确认客户端登录态")
+	if err := verifyClientSession(pre.OfficialAuthFile, uid, 20*time.Second); err != nil {
+		return fmt.Errorf("登录文件已写入，但客户端启动后仍未登录：%w；备份在 %s", err, s.clientSwitchBackupDir())
+	}
+	switchStep("done", "切换完成，客户端已以 "+acc.Nickname+" 的身份登录")
+	s.Store().Audit("client.switch", uid, "official="+pre.OfficialAuthFile)
+	return nil
+}
+
+// verifyClientSession 在客户端重启后核对登录态。
+// 判据只有一条可靠信号：客户端若拒绝该凭证，会在启动阶段 clean() 并写回 <登录位>.logged-out。
+// 因此轮询该标记出现即判失败；等到 wait 结束仍未出现，视为登录成功（客户端可能不重写文件，
+// 不能用 mtime 当成功依据）。
+func verifyClientSession(authFile, uid string, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	for {
+		if fileExists(officialAuthLogoutMarker(authFile)) {
+			return fmt.Errorf("客户端启动后重新出现登出标记（accessToken/refreshToken 被拒绝或已过期）")
+		}
+		if raw, err := os.ReadFile(authFile); err == nil {
+			// 客户端把文件改写成了别的账号，说明有另一个会话覆盖了本次写入
+			if got := clientSessionUID(raw); got != "" && got != uid {
+				return fmt.Errorf("登录位被改写成账号 %s", got)
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return nil
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+}
+
+// buildOfficialAuthFile 从池里的 UpstreamCred 构造 WorkBuddy v5.6+ 客户端期望的
+// 嵌套 session 认证文件内容。Pool 凭证本身是扁平（OAuthCredentialJSON 形态）或嵌套，
+// 经 LoadUpstreamCred 抽出统一字段后再按官方 schema 重组。
+//
+// 字段集对齐 WorkBuddy 真机 backup（Data/Public/auth 下历史 .info），关键差异是：
+//   - auth.expiresAt / auth.refreshExpiresAt / auth.lastRefreshTime 单位是毫秒，
+//     池里是秒（Unix），写入要 × 1000；
+//   - refreshExpiresIn / expiresIn 单位是秒；
+//   - 加密信封（$wbEncrypted）由官方在凭证保护策略为 fields/files 时自行生成，
+//     BuddyBot 拿不到 safeStorage key，因此不写加密字段，让官方按 off 策略直接吃 plaintext。
+//
+// nickname 单独传入：LoadUpstreamCred 不解 token payload，取自账号视图，避免重复解析。
+// 派生字段（sessionState / scope / notBeforePolicy）按官方历史 backup 的口径填——
+// 官方客户端首次读 session 不会校验这些，但留齐可避免后续版本差异打回。
+func buildOfficialAuthFile(cred *UpstreamCred, nickname string) ([]byte, error) {
+	if cred == nil {
+		return nil, fmt.Errorf("凭证为空")
+	}
+	if strings.TrimSpace(cred.AccessToken) == "" {
+		return nil, fmt.Errorf("凭证缺少 accessToken")
+	}
+	now := time.Now()
+	nowSec := now.Unix()
+	nowMs := now.UnixMilli()
+
+	// refreshToken / accessToken 有效期都靠 accessToken.expiresAt 兜底；
+	// refreshExpiresAt 不知道，按官方常见策略给一年（实际 refresh 多久以官方续期
+	// 行为为准；写短一点比写过长安全——写过长也不会更久）。
+	const refreshLifetimeSec = 365 * 24 * 3600
+	refreshExpMs := nowMs + int64(refreshLifetimeSec)*1000
+
+	expiresMs := cred.ExpiresAtUnix * 1000
+	expiresIn := cred.ExpiresAtUnix - nowSec
+	if expiresIn < 0 {
+		expiresIn = 0
+	}
+
+	auth := map[string]any{
+		"accessToken":       cred.AccessToken,
+		"refreshToken":      cred.RefreshToken,
+		"idToken":           "",            // OIDC 标准字段；无值时留空，避免客户端报登录文件不完整
+		"tokenType":         "Bearer",
+		"domain":            cred.Domain,
+		"expiresAt":         expiresMs,     // ms
+		"expiresIn":         expiresIn,     // sec，剩余秒（≤0 视为已过期）
+		"refreshExpiresIn":  refreshLifetimeSec,
+		"refreshExpiresAt":  refreshExpMs,  // ms
+		"lastRefreshTime":   nowMs,         // ms，官方按当前时间更新
+		"createdAt":         nowMs,         // ms，登录文件创建时间
+		"updatedAt":         nowMs,         // ms，登录文件更新时间
+		"scope":             "openid profile offline_access email",
+		"sessionState":      uuid.NewString(),
+		"notBeforePolicy":   nowSec,
+	}
+
+	account := map[string]any{
+		"uid":           cred.UID,
+		"nickname":      nickname,
+		"type":          "personal",
+		"lastLogin":     true,
+		"isCreator":     false,
+		"pluginEnabled": true,
+	}
+
+	// 历史登录账号列表：仅含当前一个（其他账号 BuddyBot 无从得知，避免假数据）
+	accounts := []map[string]any{account}
+
+	sess := map[string]any{
+		"auth":     auth,
+		"account":  account,
+		"accounts": accounts,
+	}
+
+	return json.MarshalIndent(sess, "", "  ")
+}
+
+// clientProcessRunning 探测官方客户端是否在运行（按二进制路径匹配）
+func clientProcessRunning(bin string) bool {
+	switch runtime.GOOS {
+	case "darwin", "linux":
+		out, err := exec.Command("pgrep", "-f", bin).Output()
+		return err == nil && len(strings.TrimSpace(string(out))) > 0
+	case "windows":
+		out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("IMAGENAME eq %s", filepath.Base(bin)), "/FO", "CSV").Output()
+		return err == nil && strings.Contains(strings.ToLower(string(out)), strings.ToLower(filepath.Base(bin)))
+	}
+	return false
+}
+
+// stopOfficialClient 退出客户端：macOS 优雅退出（osascript quit）+ 路径精确 pkill 兜底；
+// Windows 按可执行路径精确结束（不按映像名，避免误伤其他 Electron 应用）。
+func stopOfficialClient(bin, _ string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		// 应用名从二进制路径推导（兼容 WorkBuddy AI 等企业定制版；进程名是
+		// Electron，不能按 "WorkBuddy" killall）。先 AppleScript 正常退出让
+		// Electron 保存会话，pkill 仅兜底。
+		appName := strings.TrimSuffix(filepath.Base(filepath.Dir(filepath.Dir(bin))), ".app")
+		if appName != "" && appName != "MacOS" {
+			_ = exec.Command("osascript", "-e", "quit app \""+appName+"\"").Run()
+		}
+		time.Sleep(2 * time.Second)
+		if clientProcessRunning(bin) {
+			_ = exec.Command("pkill", "-f", bin).Run()
+			time.Sleep(1 * time.Second)
+		}
+		return nil
+	case "windows":
+		script := fmt.Sprintf(
+			`Get-Process | Where-Object { $_.Path -eq '%s' } | Stop-Process -Force`, bin)
+		return exec.Command("powershell", "-NoProfile", "-Command", script).Run()
+	default:
+		_ = exec.Command("pkill", "-f", bin).Run()
+		return nil
+	}
+}
+
+// startOfficialClient 重新启动客户端。
+// cdpPort > 0 时带 --remote-debugging-port 启动（macOS 直接执行二进制以保证
+// 参数生效，对齐 WorkDaddy relaunch-with-cdp.sh）——否则切换后客户端以普通
+// 模式运行，下次注入又要强杀重启一次。
+func startOfficialClient(bin string, cdpPort int) error {
+	arg := ""
+	if cdpPort > 0 {
+		arg = fmt.Sprintf("--remote-debugging-port=%d", cdpPort)
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		if arg != "" {
+			cmd := exec.Command(bin, arg)
+			if err := cmd.Start(); err != nil {
+				return err
+			}
+			go func() { _ = cmd.Process.Release() }() // 长驻进程交给用户管理，避免僵尸
+			return nil
+		}
+		app := filepath.Dir(filepath.Dir(bin)) // .app 目录
+		return exec.Command("open", app).Start()
+	case "windows":
+		if arg != "" {
+			return exec.Command("cmd", "/c", "start", "", bin, arg).Start()
+		}
+		return exec.Command("cmd", "/c", "start", "", bin).Start()
+	default:
+		if arg != "" {
+			return exec.Command(bin, arg).Start()
+		}
+		return exec.Command(bin).Start()
+	}
+}
+
+// ClientRestoreAuthBackup 用登录态备份（官方登录文件原文）恢复官方登录位并重启客户端。
+// 防御校验与 ClientSwitchAccount 同一口径：
+//   - 备份内容必须可解析（坏数据拒绝，防止毁掉登录位）；
+//   - 官方现有登录文件存在但无法解析时拒绝覆盖；
+//   - 备份与官方当前登录跨通道（国内/国际）时拒绝。
+//
+// 每步发 EventClientSwitch 进度事件（step: check/stop/write/start/done/error）。
+func (s *Service) ClientRestoreAuthBackup(raw []byte) error {
+	if len(raw) == 0 {
+		return fmt.Errorf("备份内容为空")
+	}
+	authFile, err := OfficialClientAuthFile()
+	if err != nil {
+		return err
+	}
+	cred, perr := ParseCredential(authFile, raw)
+	if perr != nil {
+		return fmt.Errorf("备份内容无法解析，为保护登录位已拒绝恢复: %w", perr)
+	}
+
+	switchStep := func(step, message string) {
+		EmitEvent(EventClientSwitch, map[string]any{"step": step, "uid": cred.UID, "message": message})
+	}
+	// 官方新版登录文件 nickname 是加密信封，解析后为空，展示兜底 uid
+	name := cred.Nickname
+	if name == "" {
+		name = cred.UID
+	}
+	switchStep("check", fmt.Sprintf("校验备份账号 %s（%s 版）", name, strings.ToUpper(cred.Realm)))
+
+	// 官方当前登录校验：坏数据拒绝、跨通道拒绝
+	if cur, err := os.ReadFile(authFile); err == nil {
+		curCred, curErr := ParseCredential(authFile, cur)
+		if curErr != nil {
+			return fmt.Errorf("官方登录文件存在但无法解析，为保护现有登录已拒绝恢复")
+		}
+		if curCred.Realm != "" && cred.Realm != "" && curCred.Realm != cred.Realm {
+			return fmt.Errorf("跨通道恢复：官方当前为 %s 版登录，备份为 %s 版，已拒绝", curCred.Realm, cred.Realm)
+		}
+	}
+
+	// 退出客户端（登录文件在客户端启动时读取，热替换无效）
+	bin, _, ferr := findOfficialClient(s.GetConfig().Inject.ClientPath)
+	if ferr != nil {
+		return fmt.Errorf("未找到官方客户端，无法恢复: %w", ferr)
+	}
+	if clientProcessRunning(bin) {
+		switchStep("stop", "退出官方客户端")
+		if err := stopOfficialClient(bin, bin); err != nil {
+			return fmt.Errorf("退出客户端失败: %w", err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// 原子写入官方登录位
+	switchStep("write", fmt.Sprintf("写入账号 %s 的登录凭证", name))
+	tmp := authFile + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(authFile), 0o700); err != nil {
+		return fmt.Errorf("创建登录目录失败: %w", err)
+	}
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("写入登录文件失败: %w", err)
+	}
+	if err := os.Rename(tmp, authFile); err != nil {
+		return fmt.Errorf("替换登录文件失败: %w", err)
+	}
+	// 同样要清登出标记，否则恢复后的登录仍会被客户端忽略
+	if err := clearLogoutMarker(authFile); err != nil {
+		return fmt.Errorf("清理登录登出标记失败: %w", err)
+	}
+
+	// 重启客户端
+	switchStep("start", "重新启动官方客户端")
+	if err := startOfficialClient(bin, s.GetConfig().Inject.Port); err != nil {
+		return fmt.Errorf("启动客户端失败: %w（登录文件已写入，可手动打开客户端）", err)
+	}
+	switchStep("done", "恢复完成，客户端将以 "+name+" 的身份启动")
+	s.Store().Audit("client.restore", cred.UID, "official="+authFile)
+	return nil
+}
+
+// ClientSwitchBackups 列出切换时的官方登录文件备份
+func (s *Service) ClientSwitchBackups() []map[string]any {
+	dir := s.clientSwitchBackupDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return []map[string]any{}
+	}
+	out := []map[string]any{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".info") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		out = append(out, map[string]any{
+			"name": e.Name(),
+			"path": filepath.Join(dir, e.Name()),
+			"size": info.Size(),
+			"time": info.ModTime().Format("2006-01-02 15:04"),
+		})
+	}
+	// 新备份在前
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
+}
